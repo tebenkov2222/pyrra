@@ -23,6 +23,7 @@ import (
 	"os"
 	"syscall"
 	"time"
+        "strings"
 
 	"github.com/bufbuild/connect-go"
 	"github.com/go-kit/log"
@@ -36,6 +37,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -66,13 +68,23 @@ func cmdKubernetes(
 	certFile, privateKeyFile string,
 	mimirClient *mimir.Client,
 	mimirWriteAlertingRules bool,
+	namespacesRaw string,
 ) int {
 	setupLog := ctrl.Log.WithName("setup")
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
 	webhookServer := webhook.NewServer(webhook.Options{Port: 9443})
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+        namespaces := parseNamespaces(namespacesRaw)
+        allowedNamespaces := namespacesToSet(namespaces)
+
+	if len(namespaces) > 0 {
+		setupLog.Info("watching configured namespaces", "namespaces", namespaces)
+	} else {
+		setupLog.Info("watching all namespaces")
+	}
+
+	opts := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
@@ -80,7 +92,20 @@ func cmdKubernetes(
 		WebhookServer:    webhookServer,
 		LeaderElection:   false,
 		LeaderElectionID: "9d76195a.pyrra.dev",
-	})
+	}
+
+	if len(namespaces) > 0 {
+		defaultNamespaces := make(map[string]cache.Config, len(namespaces))
+		for _, ns := range namespaces {
+			defaultNamespaces[ns] = cache.Config{}
+		}
+
+		opts.Cache = cache.Options{
+			DefaultNamespaces: defaultNamespaces,
+		}
+	}
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), opts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
@@ -129,7 +154,8 @@ func cmdKubernetes(
 	{
 		router := http.NewServeMux()
 		router.Handle(objectivesv1alpha1connect.NewObjectiveBackendServiceHandler(&KubernetesObjectiveServer{
-			client: mgr.GetClient(),
+			client:    mgr.GetClient(),
+			namespaces: allowedNamespaces,
 		}))
 
 		server := http.Server{
@@ -166,7 +192,41 @@ type KubernetesClient interface {
 }
 
 type KubernetesObjectiveServer struct {
-	client KubernetesClient
+	client    KubernetesClient
+	namespaces map[string]struct{}
+}
+
+func parseNamespaces(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '|' || r == ' ' || r == '\t' || r == '\n'
+	}) {
+		ns := strings.TrimSpace(part)
+		if ns == "" {
+			continue
+		}
+		if _, ok := seen[ns]; ok {
+			continue
+		}
+		seen[ns] = struct{}{}
+		out = append(out, ns)
+	}
+
+	return out
+}
+
+func namespacesToSet(namespaces []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(namespaces))
+	for _, ns := range namespaces {
+		out[ns] = struct{}{}
+	}
+	return out
 }
 
 func (s *KubernetesObjectiveServer) List(ctx context.Context, req *connect.Request[objectivesv1alpha1.ListRequest]) (*connect.Response[objectivesv1alpha1.ListResponse], error) {
@@ -193,13 +253,30 @@ func (s *KubernetesObjectiveServer) List(ctx context.Context, req *connect.Reque
 	}
 
 	listOpts := client.ListOptions{}
-	for _, m := range matchers {
-		if m.Name == "namespace" && m.Type == labels.MatchEqual {
-			listOpts.Namespace = m.Value
-			break
+
+	if len(s.namespaces) > 0 {
+		if namespaceMatcher != nil && namespaceMatcher.Type == labels.MatchEqual {
+			if _, ok := s.namespaces[namespaceMatcher.Value]; !ok {
+				return connect.NewResponse(&objectivesv1alpha1.ListResponse{
+					Objectives: []*objectivesv1alpha1.Objective{},
+				}), nil
+			}
+
+			listOpts.Namespace = namespaceMatcher.Value
+		} else if len(s.namespaces) == 1 {
+			for ns := range s.namespaces {
+				listOpts.Namespace = ns
+				break
+			}
+		}
+	} else {
+		for _, m := range matchers {
+			if m.Name == "namespace" && m.Type == labels.MatchEqual {
+				listOpts.Namespace = m.Value
+				break
+			}
 		}
 	}
-
 	var list pyrrav1alpha1.ServiceLevelObjectiveList
 	if err := s.client.List(ctx, &list, &listOpts); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
