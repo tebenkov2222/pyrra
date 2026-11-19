@@ -23,7 +23,7 @@ import (
 	"os"
 	"syscall"
 	"time"
-        "strings"
+    "strings"
 
 	"github.com/bufbuild/connect-go"
 	"github.com/go-kit/log"
